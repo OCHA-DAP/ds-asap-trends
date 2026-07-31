@@ -21,6 +21,8 @@
     --neutral:     #f0efec;
     --warning:     #fab219;
     --warning-ink: #6b4a00;
+    --critical:    #d03b3b;
+    --band:        rgba(11,11,11,0.08);
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
@@ -39,6 +41,8 @@
       --neutral:     #383835;
       --warning:     #fab219;
       --warning-ink: #fab219;
+      --critical:    #d03b3b;
+      --band:        rgba(255,255,255,0.10);
     }
   }
   :root[data-theme="dark"] {
@@ -57,6 +61,8 @@
     --neutral:     #383835;
     --warning:     #fab219;
     --warning-ink: #fab219;
+    --critical:    #d03b3b;
+    --band:        rgba(255,255,255,0.10);
   }
 
   * { box-sizing: border-box; }
@@ -115,7 +121,7 @@
     background: var(--page); border: 1px solid var(--baseline);
     border-radius: 6px; padding: 7px 10px; min-height: 36px;
   }
-  select { min-width: 210px; }
+  select { min-width: 180px; max-width: 300px; }
   button.ghost { cursor: pointer; }
   button.ghost:hover { background: var(--neutral); }
   .spacer { flex: 1 1 auto; }
@@ -175,6 +181,14 @@
   .notes li { margin-bottom: 7px; }
   .notes code { font-size: 12.5px; background: var(--neutral); padding: 1px 4px; border-radius: 3px; }
   footer { color: var(--muted); font-size: 12.5px; margin-top: 8px; }
+  /* A render failure should say so rather than leave silently blank cards. */
+  #fatal {
+    position: fixed; left: 12px; right: 12px; bottom: 12px; z-index: 100;
+    background: var(--critical); color: #fff; border-radius: 8px;
+    padding: 11px 14px; font-size: 13px; line-height: 1.45;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+  }
+  #fatal code { background: rgba(255,255,255,0.18); padding: 1px 4px; border-radius: 3px; }
 </style>
 </head>
 <body>
@@ -215,8 +229,26 @@
       <label for="sel-unit">Admin unit (ASAP GAUL 1)</label>
       <select id="sel-unit"></select>
     </div>
+    <div>
+      <label for="sel-dekad">Dekad</label>
+      <select id="sel-dekad"></select>
+    </div>
     <div class="spacer"></div>
     <button class="ghost" id="theme-toggle" type="button">Toggle theme</button>
+  </div>
+
+  <div class="card">
+    <div class="hd">
+      <h2 id="season-title"></h2>
+      <p id="season-sub"></p>
+    </div>
+    <div class="tiles" id="season-tiles"></div>
+    <ul class="legend" id="legend-prog"></ul>
+    <div class="chart-host"><svg id="chart-prog"></svg></div>
+    <h3 id="units-title" style="margin-top:26px"></h3>
+    <p id="units-sub" style="margin:0 0 12px; color:var(--text-secondary); font-size:13.5px"></p>
+    <ul class="legend" id="legend-units"></ul>
+    <div class="chart-host"><svg id="chart-units"></svg></div>
   </div>
 
   <div class="card">
@@ -300,6 +332,7 @@
 </div>
 
 <div id="tip" role="status" aria-live="polite"></div>
+<div id="fatal" hidden></div>
 
 <script>
 const F = {
@@ -319,6 +352,101 @@ const svgEl = (t, a = {}) => {
 };
 
 let DATA = null, IND = null, UNIT = NATIONAL;
+/* DEKAD is either the string "season" (use the seasonal aggregate) or a dekad number.
+   dekadChosen distinguishes "the user/link picked this" from "still on the default", so
+   switching indicator keeps an explicit choice but a fresh load lands on the latest dekad. */
+let DEKAD = "season", DK = null, dekadChosen = false;
+const DK_CACHE = {};
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const DEKAD_PARTS = ["1–10", "11–20", "21+"];
+const dekadLabel = d => `${MONTHS[Math.floor((d - 1) / 3)]} ${DEKAD_PARTS[(d - 1) % 3]}`;
+const ordinal = n => n + (["th", "st", "nd", "rd"][(n % 100 > 10 && n % 100 < 14) ? 0 : Math.min(n % 10, 4)] ?? "th");
+
+function quantile(sorted, q) {
+  if (!sorted.length) return null;
+  const i = (sorted.length - 1) * q, lo = Math.floor(i), hi = Math.ceil(i);
+  return lo === hi ? sorted[lo] : sorted[lo] + (sorted[hi] - sorted[lo]) * (i - lo);
+}
+
+const unitId = name => name === NATIONAL
+  ? 0
+  : (DATA.meta.units.find(u => u.adm1_name === name)?.asap1_id ?? 0);
+
+/* Dekad-level data is one file per indicator, fetched on demand. */
+async function loadDekadal(key) {
+  if (!DK_CACHE[key]) {
+    const r = await fetch(`data/dekadal/${key}.json`);
+    if (!r.ok) throw new Error(`dekadal/${key}.json: HTTP ${r.status}`);
+    const raw = await r.json();
+    const c = raw.cols, byUnit = {};
+    for (let i = 0; i < c.unit.length; i++) {
+      ((byUnit[c.unit[i]] ??= {})[c.year[i]] ??= {})[c.dekad[i]] = { z: c.z[i], v: c.v[i] };
+    }
+    const trendIndex = {};
+    for (const t of raw.trends) trendIndex[`${t.asap1_id}|${t.dekad}`] = t;
+    DK_CACHE[key] = {
+      ...raw, byUnit, trendIndex,
+      dekads: [...new Set(c.dekad)].sort((a, b) => a - b),
+    };
+  }
+  return DK_CACHE[key];
+}
+
+/* Minimum prior years before we'll draw a percentile band for a dekad. */
+const MIN_PRIOR_YEARS = 5;
+
+function priorStats(byYear, dekad, currentYear) {
+  const prior = Object.keys(byYear).map(Number)
+    .filter(y => y !== currentYear)
+    .map(y => byYear[y]?.[dekad]?.z)
+    .filter(z => z !== null && z !== undefined)
+    .sort((a, b) => a - b);
+  return {
+    n: prior.length,
+    p10: quantile(prior, 0.10),
+    p50: quantile(prior, 0.50),
+    p90: quantile(prior, 0.90),
+  };
+}
+
+/* Per-dekad view of one unit's season: this year against the prior-year distribution. */
+function progression(uid) {
+  const cur = DK.latest.year, byYear = DK.byUnit[uid] ?? {};
+  return DK.dekads.map(dekad => {
+    const entry = byYear[cur]?.[dekad];
+    return {
+      dekad,
+      cur: entry?.z ?? null,
+      curV: entry?.v ?? null,
+      ...priorStats(byYear, dekad, cur),
+    };
+  }).filter(d => d.n >= MIN_PRIOR_YEARS || d.cur !== null);
+}
+
+/* Every admin unit at one dekad: this year against each unit's own history. */
+function unitsAtDekad(dekad) {
+  const cur = DK.latest.year;
+  return DATA.meta.units.map(u => {
+    const byYear = DK.byUnit[u.asap1_id] ?? {};
+    const entry = byYear[cur]?.[dekad];
+    return {
+      name: u.adm1_name,
+      cur: entry?.z ?? null,
+      curV: entry?.v ?? null,
+      ...priorStats(byYear, dekad, cur),
+    };
+  }).filter(r => r.cur !== null || r.n >= MIN_PRIOR_YEARS)
+    .sort((a, b) => (a.cur ?? Infinity) - (b.cur ?? Infinity));
+}
+
+/* One value per year at a fixed dekad — the like-for-like year-over-year comparison. */
+function yearSeriesAtDekad(uid, dekad) {
+  const byYear = DK.byUnit[uid] ?? {};
+  return Object.keys(byYear).map(Number).sort((a, b) => a - b)
+    .map(year => ({ year, z: byYear[year][dekad]?.z ?? null, v: byYear[year][dekad]?.v ?? null }))
+    .filter(d => d.z !== null);
+}
 
 /* ---------- tooltip ---------- */
 const tip = document.getElementById("tip");
@@ -430,6 +558,261 @@ function renderDumbbell() {
     <li><span class="swatch" style="background:var(--series-2)"></span>Last 5 years (${esc(late)})</li>`;
 }
 
+/* ---------- current-season card: tiles + progression + per-unit ---------- */
+function selectedDekad() { return DEKAD === "season" ? DK.latest.dekad : DEKAD; }
+
+function renderSeasonTiles() {
+  const ind = DATA.meta.indicators.find(i => i.key === IND);
+  const dekad = selectedDekad(), cur = DK.latest.year;
+  const series = yearSeriesAtDekad(unitId(UNIT), dekad);
+  const point = series.find(d => d.year === cur);
+  const thr = DATA.meta.warning_threshold;
+
+  document.getElementById("season-title").textContent =
+    `How is the ${cur} season tracking? — ${ind.short}`;
+  document.getElementById("season-sub").innerHTML =
+    `${cur} against every prior year at the same point in the season. Latest ASAP dekad
+     with data: <strong>${dekadLabel(DK.latest.dekad)} ${DK.latest.year}</strong>.
+     Figures below are for <strong>${esc(UNIT === NATIONAL ? "the national mean" : UNIT)}</strong>
+     at <strong>${dekadLabel(dekad)}</strong>, and use this indicator's
+     <em>full</em> record — unlike the trend charts below, which start at
+     ${DATA.meta.common_start_year} so indicators stay comparable.`;
+
+  const ranked = [...series].sort((a, b) => a.z - b.z);
+  const lowRank = point ? ranked.findIndex(d => d.year === cur) + 1 : null;
+  const n = ranked.length;
+  const highRank = lowRank ? n - lowRank + 1 : null;
+  const units = unitsAtDekad(dekad);
+  const withData = units.filter(u => u.cur !== null);
+  const below = withData.filter(u => u.cur <= thr);
+
+  const tiles = [];
+  if (point) {
+    const col = point.z <= thr ? "var(--critical)" : "var(--series-1)";
+    tiles.push(`<div class="tile"><div class="val" style="color:${col}">${F.z(point.z)}</div>
+      <div class="lbl">${cur} z-score<br>at ${dekadLabel(dekad)}</div></div>`);
+    // Whichever end of the distribution it sits nearer reads more naturally.
+    const rankTxt = lowRank <= n / 2
+      ? `${ordinal(lowRank)} lowest` : `${ordinal(highRank)} highest`;
+    tiles.push(`<div class="tile"><div class="val">${rankTxt}</div>
+      <div class="lbl">of ${n} years with data<br>at this dekad</div></div>`);
+  } else {
+    tiles.push(`<div class="tile"><div class="val">—</div>
+      <div class="lbl">no ${cur} data yet<br>at ${dekadLabel(dekad)}</div></div>`);
+  }
+  if (withData.length) {
+    tiles.push(`<div class="tile">
+      <div class="val" style="color:${below.length ? "var(--critical)" : "var(--text-primary)"}">
+        ${below.length} of ${withData.length}</div>
+      <div class="lbl">admin units at or below −1<br>(warning level) this dekad</div></div>`);
+  }
+  document.getElementById("season-tiles").innerHTML = tiles.join("");
+}
+
+function renderProgression() {
+  const svg = document.getElementById("chart-prog");
+  svg.textContent = "";
+  const host = svg.parentElement;
+  const ind = DATA.meta.indicators.find(i => i.key === IND);
+  const rows = progression(unitId(UNIT));
+  const cur = DK.latest.year;
+  if (rows.length < 2) { svg.setAttribute("height", 0); return; }
+
+  const M = { t: 12, r: 18, b: 44, l: 46 };
+  const W = Math.max(520, host.clientWidth || 640), H = 300;
+  const innerW = W - M.l - M.r, innerH = H - M.t - M.b;
+  const vals = rows.flatMap(d => [d.cur, d.p10, d.p90]).filter(v => v !== null);
+  const lo = Math.min(-1.3, ...vals) - 0.15, hi = Math.max(...vals) + 0.15;
+  const x = i => M.l + (rows.length === 1 ? innerW / 2 : (i / (rows.length - 1)) * innerW);
+  const yv = v => M.t + (1 - (v - lo) / (hi - lo)) * innerH;
+
+  svg.setAttribute("width", W);
+  svg.setAttribute("height", H);
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const g = svgEl("g");
+
+  for (const t of niceTicks(lo, hi, 7)) {
+    g.appendChild(svgEl("line", { class: "gridline", x1: M.l, x2: W - M.r, y1: yv(t), y2: yv(t) }));
+    const lab = svgEl("text", { class: "axis-num", x: M.l - 9, y: yv(t) + 4, "text-anchor": "end" });
+    lab.textContent = t.toFixed(1);
+    g.appendChild(lab);
+  }
+  rows.forEach((d, i) => {
+    if ((d.dekad - 1) % 3) return;   // label the first dekad of each month only
+    const lab = svgEl("text", { x: x(i), y: H - M.b + 20, "text-anchor": "middle" });
+    lab.textContent = MONTHS[Math.floor((d.dekad - 1) / 3)];
+    g.appendChild(lab);
+  });
+  g.appendChild(svgEl("line", { class: "axisline", x1: M.l, x2: W - M.r, y1: M.t + innerH, y2: M.t + innerH }));
+
+  // Prior-year 10th–90th percentile envelope.
+  const band = rows.filter(d => d.p10 !== null && d.p90 !== null);
+  if (band.length > 1) {
+    const fwd = band.map(d => `${x(rows.indexOf(d)).toFixed(1)},${yv(d.p90).toFixed(1)}`);
+    const rev = [...band].reverse().map(d => `${x(rows.indexOf(d)).toFixed(1)},${yv(d.p10).toFixed(1)}`);
+    g.appendChild(svgEl("path", { d: `M${fwd.join("L")}L${rev.join("L")}Z`, fill: css("--band") }));
+    g.appendChild(svgEl("path", {
+      class: "series-line", "stroke-width": 1.5, stroke: css("--muted"),
+      d: "M" + band.map(d => `${x(rows.indexOf(d)).toFixed(1)},${yv(d.p50).toFixed(1)}`).join("L"),
+    }));
+  }
+
+  g.appendChild(svgEl("line", { class: "threshold", x1: M.l, x2: W - M.r, y1: yv(-1), y2: yv(-1) }));
+  const thrLab = svgEl("text", { class: "dlabel", x: W - M.r, y: yv(-1) - 7, "text-anchor": "end" });
+  thrLab.textContent = "warning threshold z = −1";
+  g.appendChild(thrLab);
+
+  // Marker for the dekad the rest of the card is showing.
+  const selIdx = rows.findIndex(d => d.dekad === selectedDekad());
+  if (selIdx >= 0) {
+    g.appendChild(svgEl("line", {
+      x1: x(selIdx), x2: x(selIdx), y1: M.t, y2: M.t + innerH,
+      stroke: css("--baseline"), "stroke-width": 1.5,
+    }));
+  }
+
+  const curPts = rows.filter(d => d.cur !== null);
+  if (curPts.length) {
+    g.appendChild(svgEl("path", {
+      class: "series-line", stroke: css("--series-1"),
+      d: "M" + curPts.map(d => `${x(rows.indexOf(d)).toFixed(1)},${yv(d.cur).toFixed(1)}`).join("L"),
+    }));
+    for (const d of curPts) {
+      g.appendChild(svgEl("circle", {
+        cx: x(rows.indexOf(d)), cy: yv(d.cur), r: 3.5,
+        fill: d.cur <= -1 ? css("--critical") : css("--series-1"),
+        stroke: css("--surface-1"), "stroke-width": 2,
+      }));
+    }
+    const last = curPts.at(-1);
+    const endLab = svgEl("text", {
+      class: "dlabel", x: x(rows.indexOf(last)) + 8, y: yv(last.cur) + 4, "text-anchor": "start",
+    });
+    endLab.textContent = cur;
+    g.appendChild(endLab);
+  }
+
+  const band2 = innerW / Math.max(1, rows.length - 1);
+  rows.forEach((d, i) => {
+    const hit = svgEl("rect", {
+      class: "hit", x: x(i) - band2 / 2, y: M.t, width: Math.max(24, band2), height: innerH,
+    });
+    hit.addEventListener("mousemove", e => showTip(e, `
+      <div class="t-hd">${dekadLabel(d.dekad)}</div>
+      <div class="t-row"><span class="swatch" style="background:${css("--series-1")}"></span>
+        ${cur}<span class="t-val">${d.cur === null ? "no data yet" : F.z(d.cur)}</span></div>
+      <div class="t-row"><span class="swatch line" style="background:${css("--muted")}"></span>
+        Historical median<span class="t-val">${F.z(d.p50)}</span></div>
+      <div class="t-row">10th–90th pct<span class="t-val">${F.z(d.p10)} to ${F.z(d.p90)}</span></div>
+      <div class="t-row">Prior years<span class="t-val">${d.n}</span></div>
+      ${d.curV === null ? "" : `<div class="t-row">${cur} native<span class="t-val">${F.num(d.curV)} ${esc(ind.units)}</span></div>`}`));
+    hit.addEventListener("mouseleave", hideTip);
+    g.appendChild(hit);
+  });
+  svg.appendChild(g);
+
+  document.getElementById("legend-prog").innerHTML = `
+    <li><span class="swatch line" style="background:var(--series-1)"></span>${cur} (so far)</li>
+    <li><span class="swatch line" style="background:var(--muted)"></span>Historical median</li>
+    <li><span class="swatch" style="background:var(--band)"></span>Historical 10th–90th percentile</li>`;
+}
+
+function renderUnitsAtDekad() {
+  const svg = document.getElementById("chart-units");
+  svg.textContent = "";
+  const host = svg.parentElement;
+  const ind = DATA.meta.indicators.find(i => i.key === IND);
+  const dekad = selectedDekad(), cur = DK.latest.year;
+  const rows = unitsAtDekad(dekad);
+
+  document.getElementById("units-title").textContent =
+    `Every admin unit at ${dekadLabel(dekad)} — ${ind.short}`;
+  document.getElementById("units-sub").textContent =
+    `${cur} against each unit's own history at this dekad, worst first. The unit selector above does not scope this chart.`;
+
+  if (!rows.length) { svg.setAttribute("height", 0); return; }
+
+  // Extra top margin leaves room for the threshold label above the first row.
+  const M = { t: 24, r: 66, b: 36, l: 148 };
+  const rowH = 27;
+  const W = Math.max(520, host.clientWidth || 640);
+  const H = M.t + rows.length * rowH + M.b;
+  const innerW = W - M.l - M.r;
+  const vals = rows.flatMap(r => [r.cur, r.p10, r.p90]).filter(v => v !== null);
+  const lo = Math.min(-1.3, ...vals) - 0.2, hi = Math.max(...vals) + 0.2;
+  const x = v => M.l + ((v - lo) / (hi - lo)) * innerW;
+
+  svg.setAttribute("width", W);
+  svg.setAttribute("height", H);
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const g = svgEl("g");
+
+  for (const t of niceTicks(lo, hi, 6)) {
+    g.appendChild(svgEl("line", { class: "gridline", x1: x(t), x2: x(t), y1: M.t, y2: M.t + rows.length * rowH }));
+    const lab = svgEl("text", { class: "axis-num", x: x(t), y: H - M.b + 18, "text-anchor": "middle" });
+    lab.textContent = t.toFixed(1);
+    g.appendChild(lab);
+  }
+  const cap = svgEl("text", { x: M.l, y: H - 3, "text-anchor": "start" });
+  cap.textContent = "z-score";
+  g.appendChild(cap);
+
+  g.appendChild(svgEl("line", {
+    class: "threshold", x1: x(-1), x2: x(-1), y1: M.t, y2: M.t + rows.length * rowH,
+  }));
+  const thrLab = svgEl("text", { class: "dlabel", x: x(-1), y: M.t - 9, "text-anchor": "middle" });
+  thrLab.textContent = "warning threshold z = −1";
+  g.appendChild(thrLab);
+
+  rows.forEach((r, i) => {
+    const cy = M.t + i * rowH + rowH / 2;
+    const name = svgEl("text", { x: M.l - 12, y: cy + 4, "text-anchor": "end" });
+    name.textContent = r.name;
+    g.appendChild(name);
+
+    if (r.p10 !== null && r.p90 !== null) {
+      g.appendChild(svgEl("line", {
+        x1: x(r.p10), x2: x(r.p90), y1: cy, y2: cy,
+        stroke: css("--baseline"), "stroke-width": 3, "stroke-linecap": "round",
+      }));
+      g.appendChild(svgEl("line", {
+        x1: x(r.p50), x2: x(r.p50), y1: cy - 5, y2: cy + 5,
+        stroke: css("--muted"), "stroke-width": 2,
+      }));
+    }
+    if (r.cur !== null) {
+      g.appendChild(svgEl("circle", {
+        cx: x(r.cur), cy, r: 5,
+        fill: r.cur <= DATA.meta.warning_threshold ? css("--critical") : css("--series-1"),
+        stroke: css("--surface-1"), "stroke-width": 2,
+      }));
+      const lab = svgEl("text", { class: "dlabel axis-num", x: W - M.r + 10, y: cy + 4, "text-anchor": "start" });
+      lab.textContent = F.z(r.cur);
+      g.appendChild(lab);
+    }
+
+    const hit = svgEl("rect", { class: "hit", x: M.l, y: cy - rowH / 2, width: innerW + M.r, height: rowH });
+    hit.addEventListener("mousemove", e => showTip(e, `
+      <div class="t-hd">${esc(r.name)} · ${dekadLabel(dekad)}</div>
+      <div class="t-row"><span class="swatch" style="background:${r.cur !== null && r.cur <= -1 ? css("--critical") : css("--series-1")}"></span>
+        ${cur}<span class="t-val">${r.cur === null ? "no data" : F.z(r.cur)}</span></div>
+      <div class="t-row"><span class="swatch line" style="background:${css("--muted")}"></span>
+        Historical median<span class="t-val">${F.z(r.p50)}</span></div>
+      <div class="t-row">10th–90th pct<span class="t-val">${F.z(r.p10)} to ${F.z(r.p90)}</span></div>
+      <div class="t-row">Prior years<span class="t-val">${r.n}</span></div>
+      ${r.curV === null ? "" : `<div class="t-row">${cur} native<span class="t-val">${F.num(r.curV)} ${esc(ind.units)}</span></div>`}`));
+    hit.addEventListener("mouseleave", hideTip);
+    g.appendChild(hit);
+  });
+  svg.appendChild(g);
+
+  document.getElementById("legend-units").innerHTML = `
+    <li><span class="swatch" style="background:var(--series-1)"></span>${cur}, above −1</li>
+    <li><span class="swatch" style="background:var(--critical)"></span>${cur}, at or below −1 (warning level)</li>
+    <li><span class="swatch line" style="background:var(--baseline)"></span>Historical 10th–90th percentile</li>
+    <li><span class="swatch line" style="background:var(--muted)"></span>Historical median</li>`;
+}
+
 /* ---------- chart 2: annual z-score time series ---------- */
 function renderTimeSeries() {
   const svg = document.getElementById("chart-ts");
@@ -437,17 +820,45 @@ function renderTimeSeries() {
   const host = svg.parentElement;
   const ind = DATA.meta.indicators.find(i => i.key === IND);
 
-  const series = DATA.annual
-    .filter(r => r.indicator === IND && r.adm1_name === UNIT && r.year >= DATA.meta.common_start_year)
-    .sort((a, b) => a.year - b.year);
-  const fit = DATA.trends.find(t =>
-    t.indicator === IND && t.adm1_name === UNIT && t.stat === "z_mean" &&
-    t.period === DATA.meta.common_start_year + "+");
+  const start = DATA.meta.common_start_year;
+  // The first paint happens before the dekad-level file has loaded, so fall back to the
+  // seasonal aggregate until it is available.
+  const perDekad = DEKAD !== "season" && DK !== null;
+  const zNote = ind.published_zscore
+    ? "ASAP's published z-score"
+    : "the z-score derived here from ASAP's raw values (ASAP does not publish a z-score for this indicator)";
 
-  document.getElementById("ts-title").textContent = `${ind.label} — ${UNIT === NATIONAL ? "national" : UNIT}`;
-  document.getElementById("ts-sub").innerHTML = ind.published_zscore
-    ? "Seasonal mean and seasonal minimum of ASAP's published z-score, one point per year."
-    : "Seasonal mean and seasonal minimum of the z-score derived here from ASAP's raw values (ASAP does not publish a z-score for this indicator).";
+  // Two modes: the seasonal aggregate (mean + worst dekad), or a single dekad compared
+  // like-for-like across years. Both are one point per year.
+  let series, fit;
+  if (perDekad) {
+    series = yearSeriesAtDekad(unitId(UNIT), DEKAD)
+      .filter(d => d.year >= start)
+      .map(d => ({ year: d.year, primary: d.z, secondary: null, native: d.v }));
+    fit = DK.trendIndex[`${unitId(UNIT)}|${DEKAD}`];
+  } else {
+    series = DATA.annual
+      .filter(r => r.indicator === IND && r.adm1_name === UNIT && r.year >= start)
+      .sort((a, b) => a.year - b.year)
+      .map(r => ({
+        year: r.year, primary: r.z_mean, secondary: r.z_min,
+        native: r.mean, frac_below: r.frac_below,
+      }));
+    fit = DATA.trends.find(t =>
+      t.indicator === IND && t.adm1_name === UNIT && t.stat === "z_mean" &&
+      t.period === start + "+");
+  }
+
+  const partial = DATA.meta.current_year;
+  document.getElementById("ts-title").textContent =
+    `${ind.label} — ${UNIT === NATIONAL ? "national" : UNIT}` +
+    (perDekad ? ` at ${dekadLabel(DEKAD)}` : "");
+  document.getElementById("ts-sub").innerHTML = perDekad
+    ? `Value of ${zNote} at <strong>${dekadLabel(DEKAD)}</strong> in each year — the
+       like-for-like comparison, unaffected by how much of the season has elapsed.`
+    : `Seasonal mean and seasonal minimum of ${zNote}, one point per year.
+       <strong>${partial}</strong> is a partial season (hollow marker) — pick a specific
+       dekad above to compare years at the same point instead.`;
 
   const cav = document.getElementById("ts-caveat");
   cav.innerHTML = ind.caveat ? `<div class="badge">
@@ -461,7 +872,7 @@ function renderTimeSeries() {
   const W = Math.max(520, host.clientWidth || 640), H = 300;
   const innerW = W - M.l - M.r, innerH = H - M.t - M.b;
   const years = series.map(d => d.year);
-  const vals = series.flatMap(d => [d.z_mean, d.z_min]).filter(v => v !== null);
+  const vals = series.flatMap(d => [d.primary, d.secondary]).filter(v => v !== null);
   const lo = Math.min(-1.35, ...vals) - 0.15, hi = Math.max(...vals) + 0.15;
   const x = y => M.l + ((y - years[0]) / Math.max(1, years.at(-1) - years[0])) * innerW;
   const yv = v => M.t + (1 - (v - lo) / (hi - lo)) * innerH;
@@ -493,8 +904,10 @@ function renderTimeSeries() {
 
   const path = (key) => series.filter(d => d[key] !== null)
     .map((d, i) => `${i ? "L" : "M"}${x(d.year).toFixed(1)},${yv(d[key]).toFixed(1)}`).join("");
-  g.appendChild(svgEl("path", { class: "series-line", d: path("z_min"), stroke: css("--series-2") }));
-  g.appendChild(svgEl("path", { class: "series-line", d: path("z_mean"), stroke: css("--series-1") }));
+  if (series.some(d => d.secondary !== null)) {
+    g.appendChild(svgEl("path", { class: "series-line", d: path("secondary"), stroke: css("--series-2") }));
+  }
+  g.appendChild(svgEl("path", { class: "series-line", d: path("primary"), stroke: css("--series-1") }));
 
   if (fit && fit.fit_intercept !== null && fit.slope_per_decade !== null) {
     const slope = fit.slope_per_decade / 10;
@@ -507,11 +920,15 @@ function renderTimeSeries() {
   }
 
   for (const d of series) {
-    for (const [key, colour] of [["z_min", css("--series-2")], ["z_mean", css("--series-1")]]) {
+    for (const [key, colour] of [["secondary", css("--series-2")], ["primary", css("--series-1")]]) {
       if (d[key] === null) continue;
+      // The current year's seasonal aggregate covers only part of the season — draw it
+      // hollow so it isn't read as comparable to the complete years beside it.
+      const incomplete = !perDekad && d.year === partial;
       g.appendChild(svgEl("circle", {
-        cx: x(d.year), cy: yv(d[key]), r: 4, fill: colour,
-        stroke: css("--surface-1"), "stroke-width": 2,
+        cx: x(d.year), cy: yv(d[key]), r: incomplete ? 4.5 : 4,
+        fill: incomplete ? css("--surface-1") : colour,
+        stroke: incomplete ? colour : css("--surface-1"), "stroke-width": 2,
       }));
     }
   }
@@ -523,23 +940,33 @@ function renderTimeSeries() {
       class: "hit", x: x(d.year) - band / 2, y: M.t,
       width: Math.max(24, band), height: innerH,
     });
-    hit.addEventListener("mousemove", e => showTip(e, `
-      <div class="t-hd">${d.year}${UNIT === NATIONAL ? "" : " · " + esc(UNIT)}</div>
+    hit.addEventListener("mousemove", e => showTip(e, perDekad ? `
+      <div class="t-hd">${d.year} · ${dekadLabel(DEKAD)}${UNIT === NATIONAL ? "" : " · " + esc(UNIT)}</div>
       <div class="t-row"><span class="swatch" style="background:${css("--series-1")}"></span>
-        Seasonal mean<span class="t-val">${F.z(d.z_mean)}</span></div>
+        z-score<span class="t-val">${F.z(d.primary)}</span></div>
+      <div class="t-row">Native units<span class="t-val">${F.num(d.native)} ${esc(ind.units)}</span></div>`
+    : `
+      <div class="t-hd">${d.year}${d.year === partial ? " (partial season)" : ""}${UNIT === NATIONAL ? "" : " · " + esc(UNIT)}</div>
+      <div class="t-row"><span class="swatch" style="background:${css("--series-1")}"></span>
+        Seasonal mean<span class="t-val">${F.z(d.primary)}</span></div>
       <div class="t-row"><span class="swatch" style="background:${css("--series-2")}"></span>
-        Seasonal min<span class="t-val">${F.z(d.z_min)}</span></div>
+        Seasonal min<span class="t-val">${F.z(d.secondary)}</span></div>
       <div class="t-row" style="margin-top:4px">Dekads below −1<span class="t-val">${F.pct(d.frac_below)}</span></div>
-      <div class="t-row">Native units (mean)<span class="t-val">${F.num(d.mean)} ${esc(ind.units)}</span></div>`));
+      <div class="t-row">Native units (mean)<span class="t-val">${F.num(d.native)} ${esc(ind.units)}</span></div>`));
     hit.addEventListener("mouseleave", hideTip);
     g.appendChild(hit);
   }
   svg.appendChild(g);
 
-  document.getElementById("legend-ts").innerHTML = `
+  const fitNote = fit && fit.p_value !== null && fit.p_value < 0.05
+    ? `Theil–Sen fit (${F.z(fit.slope_per_decade)} z/decade, p ${F.p(fit.p_value)})`
+    : `Theil–Sen fit (${fit ? F.z(fit.slope_per_decade) + " z/decade, not significant" : "n/a"})`;
+  document.getElementById("legend-ts").innerHTML = perDekad ? `
+    <li><span class="swatch line" style="background:var(--series-1)"></span>z at ${dekadLabel(DEKAD)}</li>
+    <li><span class="swatch dash"></span>${fitNote}</li>` : `
     <li><span class="swatch line" style="background:var(--series-1)"></span>Seasonal mean z</li>
     <li><span class="swatch line" style="background:var(--series-2)"></span>Seasonal minimum z</li>
-    <li><span class="swatch dash"></span>Theil–Sen fit (mean)</li>`;
+    <li><span class="swatch dash"></span>${fitNote}</li>`;
 }
 
 /* ---------- chart 3: slope per decade by admin unit ---------- */
@@ -703,7 +1130,90 @@ function renderLede() {
 }
 
 /* ---------- wiring ---------- */
-function renderAll() { renderLede(); renderDumbbell(); renderTimeSeries(); renderSlopes(); renderTable(); }
+
+/* The current view lives in the query string, so a particular indicator/unit/dekad can
+   be linked to directly. */
+function syncUrl() {
+  const p = new URLSearchParams({ i: IND, u: UNIT, d: String(DEKAD) });
+  history.replaceState(null, "", `?${p}${location.hash}`);
+}
+
+function readUrl(meta) {
+  const p = new URLSearchParams(location.search);
+  const i = p.get("i");
+  if (i && meta.indicators.some(x => x.key === i)) IND = i;
+  const u = p.get("u");
+  if (u === NATIONAL || meta.units.some(x => x.adm1_name === u)) UNIT = u;
+  const d = p.get("d");
+  if (d === "season") { DEKAD = "season"; dekadChosen = true; }
+  else if (d && Number.isFinite(Number(d))) { DEKAD = Number(d); dekadChosen = true; }
+}
+
+function showFatal(err, where) {
+  const el = document.getElementById("fatal");
+  el.hidden = false;
+  el.innerHTML = `<strong>Something failed while drawing “${esc(where)}”.</strong>
+    <code>${esc(err && err.message ? err.message : String(err))}</code>
+    — the other charts on the page are unaffected.`;
+  console.error(where, err);
+}
+
+/* Each chart is isolated: one failing chart must not blank the ones after it. */
+function guard(fn, where) {
+  try { fn(); } catch (err) { showFatal(err, where); }
+}
+
+function renderSeason() {
+  guard(renderSeasonTiles, "season summary");
+  guard(renderProgression, "season progression");
+  guard(renderUnitsAtDekad, "admin units at dekad");
+}
+function renderAll() {
+  guard(renderLede, "headline");
+  guard(renderDumbbell, "threshold breaches");
+  if (DK) renderSeason();
+  guard(renderTimeSeries, "year-by-year series");
+  guard(renderSlopes, "trend by admin unit");
+  guard(renderTable, "table view");
+}
+
+/* Repopulate the dekad list for the loaded indicator, keeping the current choice if it
+   still exists, else defaulting to the latest dekad with data ("how are things now"). */
+function fillDekadSelector() {
+  const sel = document.getElementById("sel-dekad");
+  const previous = DEKAD;
+  sel.innerHTML = "";
+  const seasonOpt = document.createElement("option");
+  seasonOpt.value = "season";
+  seasonOpt.textContent = "Whole season (aggregate)";
+  sel.appendChild(seasonOpt);
+  const og = document.createElement("optgroup");
+  og.label = "Single dekad";
+  for (const d of DK.dekads) {
+    const o = document.createElement("option");
+    o.value = String(d);
+    o.textContent = dekadLabel(d) + (d === DK.latest.dekad ? "  (latest)" : "");
+    og.appendChild(o);
+  }
+  sel.appendChild(og);
+  if (!dekadChosen) DEKAD = DK.latest.dekad;
+  else if (previous !== "season" && !DK.dekads.includes(previous)) DEKAD = DK.latest.dekad;
+  sel.value = String(DEKAD);
+}
+
+async function switchIndicator(key) {
+  IND = key;
+  try {
+    DK = await loadDekadal(key);
+    fillDekadSelector();
+  } catch (err) {
+    DK = null;
+    document.getElementById("season-sub").textContent =
+      `Could not load dekad-level data for this indicator (${err.message}).`;
+  }
+  syncUrl();
+  renderAll();
+}
 
 function init(data) {
   DATA = data;
@@ -737,6 +1247,8 @@ function init(data) {
                  t.p_value !== null && t.p_value < 0.05)
     .sort((a, b) => b.slope_per_decade - a.slope_per_decade)[0];
   if (lead) IND = lead.indicator;
+  // A link's own selection wins over the default.
+  readUrl(m);
   selI.value = IND;
 
   const selU = document.getElementById("sel-unit");
@@ -748,8 +1260,20 @@ function init(data) {
   }
   selU.value = UNIT;
 
-  selI.addEventListener("change", e => { IND = e.target.value; renderTimeSeries(); renderSlopes(); });
-  selU.addEventListener("change", e => { UNIT = e.target.value; renderTimeSeries(); });
+  selI.addEventListener("change", e => switchIndicator(e.target.value));
+  selU.addEventListener("change", e => {
+    UNIT = e.target.value;
+    syncUrl();
+    if (DK) renderSeason();
+    renderTimeSeries();
+  });
+  document.getElementById("sel-dekad").addEventListener("change", e => {
+    DEKAD = e.target.value === "season" ? "season" : Number(e.target.value);
+    dekadChosen = true;
+    syncUrl();
+    if (DK) renderSeason();
+    renderTimeSeries();
+  });
   document.getElementById("theme-toggle").addEventListener("click", () => {
     const dark = matchMedia("(prefers-color-scheme: dark)").matches;
     const cur = document.documentElement.getAttribute("data-theme") ?? (dark ? "dark" : "light");
@@ -759,7 +1283,9 @@ function init(data) {
 
   let t;
   addEventListener("resize", () => { clearTimeout(t); t = setTimeout(renderAll, 140); });
+  // Renders once immediately, then again when the dekad-level file lands.
   renderAll();
+  switchIndicator(IND);
 }
 
 fetch("data/asap_trends.json")

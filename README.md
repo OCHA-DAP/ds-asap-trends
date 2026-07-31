@@ -66,6 +66,28 @@ per unit × indicator:
 Year-to-year persistence is not corrected for, so p-values are mildly optimistic; read
 p < 0.05 as "worth looking at", not as a formal field-significant result.
 
+### The within-season view
+
+The trend answers "has the threshold drifted". A second question — **"how is the current
+season actually tracking"** — needs the dekad-level series, so `dekadal_frame` keeps one row
+per unit × year × dekad and `dekad_trends` fits a separate trend for each dekad of the
+season. The site uses this to compare the current year against every prior year *at the same
+point in the season*, three ways:
+
+- **Season progression** — this year against the prior-year 10th–90th percentile envelope
+  and median, dekad by dekad.
+- **A dekad selector** — pins the year-over-year chart to a single dekad, which is the
+  like-for-like comparison. A seasonal mean is *not* comparable mid-season, since the current
+  year's is computed over a partial season; the site draws that year's marker hollow to say so.
+- **All admin units at one dekad** — each unit's current value against its own history, worst
+  first, so it is obvious which units sit near warning level right now.
+
+These use each indicator's **full** record (more history, better percentiles), whereas the
+trend figures use the common 2001+ window for cross-indicator comparability. The site states
+which is which.
+
+Views are linkable: `?i=<indicator>&u=<admin unit>&d=<dekad|season>`.
+
 ## Usage
 
 ```bash
@@ -74,8 +96,10 @@ uv run python scripts/download.py --country SSD   # cached in data/raw/
 uv run python scripts/analyze.py  --country SSD   # -> data/processed/ + docs/data/
 ```
 
-The site is plain HTML in `docs/`, reading `docs/data/asap_trends.json`. `.github/workflows/update.yml`
-re-runs both scripts monthly and on push, then deploys Pages.
+The site is plain HTML in `docs/`, reading `docs/data/asap_trends.json` (~890 KB, the annual
+and trend layer) plus `docs/data/dekadal/<indicator>.json` (~300–400 KB each, the within-season
+layer, fetched only for the indicator being viewed). `.github/workflows/update.yml` re-runs both
+scripts monthly and on push, then deploys Pages.
 
 ## Caveats
 

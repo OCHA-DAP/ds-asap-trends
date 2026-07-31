@@ -19,11 +19,15 @@ from src.constants import (  # noqa: E402
     INDICATORS,
     PROCESSED_DIR,
     SITE_DATA_DIR,
+    SITE_DEKADAL_DIR,
     WARNING_Z_THRESHOLD,
 )
 from src.trends import (  # noqa: E402
     NATIONAL_LABEL,
     compute_trends,
+    dekad_trends,
+    dekadal_frame,
+    derive_zscore,
     seasonal_aggregate,
     warning_frequency_shift,
 )
@@ -60,6 +64,49 @@ def national_annual(annual: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
         .assign(asap1_id=0, adm1_name=NATIONAL_LABEL)
     )
+
+
+def write_dekadal_files(dekadal: pd.DataFrame, dk_trends: pd.DataFrame) -> int:
+    """One JSON per indicator: the within-season series plus its per-dekad trends.
+
+    Stored as parallel arrays rather than a list of objects -- the field names would
+    otherwise repeat ~11k times per indicator. Returns total bytes written.
+    """
+    SITE_DEKADAL_DIR.mkdir(parents=True, exist_ok=True)
+    total = 0
+    for indicator, group in dekadal.groupby("indicator"):
+        group = group.sort_values(["asap1_id", "year", "dekad"])
+        latest = group[group["year"] == group["year"].max()]
+        payload = {
+            "indicator": indicator,
+            "unit_names": {
+                str(int(r.asap1_id)): r.adm1_name
+                for r in group[["asap1_id", "adm1_name"]].drop_duplicates().itertuples()
+            },
+            # The most recent dekad with data, so the site can default to "now".
+            "latest": {
+                "year": int(group["year"].max()),
+                "dekad": int(latest["dekad"].max()),
+            },
+            "cols": {
+                "unit": [int(v) for v in group["asap1_id"]],
+                "year": [int(v) for v in group["year"]],
+                "dekad": [int(v) for v in group["dekad"]],
+                "z": [None if pd.isna(v) else round(float(v), 2) for v in group["z"]],
+                "v": [
+                    None if pd.isna(v) else round(float(v), 2) for v in group["value"]
+                ],
+            },
+            "trends": round_floats(
+                dk_trends[dk_trends["indicator"] == indicator]
+                .drop(columns=["indicator"])
+                .to_dict("records")
+            ),
+        }
+        out = SITE_DEKADAL_DIR / f"{indicator}.json"
+        out.write_text(json.dumps(payload, separators=(",", ":")))
+        total += out.stat().st_size
+    return total
 
 
 def round_floats(obj, places: int = 4):
@@ -101,7 +148,10 @@ def main() -> None:
         raw["date"].max().date(),
     )
 
-    annual = seasonal_aggregate(raw)
+    # Derive z-scores once; both the annual and dekadal views reuse them.
+    with_z = derive_zscore(raw)
+    annual = seasonal_aggregate(with_z)
+    dekadal = dekadal_frame(with_z)
     # Trends over the common window are the headline (comparable across indicators);
     # full-record trends are kept alongside since the meteo series start in 1989.
     common = annual[annual["year"] >= COMMON_START_YEAR]
@@ -135,6 +185,7 @@ def main() -> None:
             "date_max": str(raw["date"].max().date()),
             "warning_threshold": WARNING_Z_THRESHOLD,
             "common_start_year": COMMON_START_YEAR,
+            "current_year": int(dekadal["year"].max()),
             "indicators": [
                 {
                     **{
@@ -174,6 +225,15 @@ def main() -> None:
     out = SITE_DATA_DIR / "asap_trends.json"
     out.write_text(json.dumps(round_floats(payload), separators=(",", ":")))
     logger.info("wrote %s (%.0f KB)", out, out.stat().st_size / 1024)
+
+    dk_trends = dekad_trends(dekadal, COMMON_START_YEAR)
+    dekadal_bytes = write_dekadal_files(dekadal, dk_trends)
+    logger.info(
+        "wrote %d dekadal files to %s (%.0f KB total, loaded one at a time)",
+        dekadal["indicator"].nunique(),
+        SITE_DEKADAL_DIR,
+        dekadal_bytes / 1024,
+    )
 
     # Console summary of the headline result: national z-score trend per indicator.
     national = trends[

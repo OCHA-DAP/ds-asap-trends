@@ -28,6 +28,15 @@ severity. Frame results that way; the slope is a means, not the finding.
   reproduce. It is a proxy — a good one for trend direction, not a warning count.
 - **FPAR record is spliced** (MODIS then VIIRS). Treat un-normalized FPAR trends with
   suspicion; cross-check against SPI-3, which is rainfall-only.
+- **Never compare a mid-season seasonal aggregate across years.** The current year's
+  `z_mean`/`z_min` covers only the dekads elapsed so far, so it is not comparable to a
+  complete year's. For year-over-year comparison during a season, fix the dekad
+  (`yearSeriesAtDekad` on the site). The site marks the partial year with a hollow marker;
+  don't remove that.
+- **Two different baselines are in play, deliberately.** The within-season charts use each
+  indicator's full record (better percentiles); the trend figures use `COMMON_START_YEAR`
+  (cross-indicator comparability). So the season card can say "of 38 years" while the trend
+  chart shows 26 points. The UI explains it — keep that explanation if you touch the copy.
 
 ## Conventions
 
@@ -38,3 +47,19 @@ work without installing the package.
 No blob or DB dependency: raw is gitignored and re-downloadable, derived outputs are
 committed so GH Pages builds standalone. Don't add a stratus dependency unless the
 outputs actually need to be shared with another repo.
+
+## The site
+
+Vanilla HTML/SVG in `docs/`, no build step and no external requests (Pages + CSP-friendly).
+Two data layers: `docs/data/asap_trends.json` loads up front; `docs/data/dekadal/<key>.json`
+is fetched lazily per indicator and cached in `DK_CACHE`.
+
+- **`DK` is null until the first dekadal fetch resolves.** `init()` paints once immediately
+  for speed, then again after `switchIndicator`. Any code path reachable from that first
+  paint must tolerate `DK === null` — this already caused one bug where a `?d=` URL threw
+  and aborted the rest of `init()`.
+- Every chart is wrapped in `guard()`, so one failure surfaces in the `#fatal` banner
+  instead of silently blanking the charts after it. Keep new charts inside `guard()`.
+- Chart state is mirrored to the query string (`?i=&u=&d=`), which is also the easiest way
+  to test a specific view headlessly:
+  `chrome --headless --dump-dom "…?i=sm_crop&u=Warab&d=19" | grep 'id="fatal" hidden'`.

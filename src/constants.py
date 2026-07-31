@@ -14,6 +14,8 @@ DATA_DIR = Path(__file__).parent.parent / "data"
 RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
 SITE_DATA_DIR = Path(__file__).parent.parent / "docs" / "data"
+# One file per indicator, fetched lazily by the site so the initial load stays small.
+SITE_DEKADAL_DIR = SITE_DATA_DIR / "dekadal"
 
 # ASAP's own country id (asap0_id), not an ISO code. From ASAP_META_URL.
 COUNTRIES = {"SSD": 88}

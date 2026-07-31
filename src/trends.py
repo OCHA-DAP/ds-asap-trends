@@ -79,7 +79,9 @@ def seasonal_aggregate(df: pd.DataFrame) -> pd.DataFrame:
     - ``z_min``: has the worst dekad of the season shifted? (what warnings react to)
     - ``frac_below``: what share of the season's dekads breached the -1 threshold?
     """
-    df = derive_zscore(df).dropna(subset=["value"])
+    if "z" not in df.columns:
+        df = derive_zscore(df)
+    df = df.dropna(subset=["value"]).copy()
     df["year"] = df["date"].dt.year
     keys = ["indicator", "asap1_id", "adm1_name", "year"]
 
@@ -103,6 +105,53 @@ def seasonal_aggregate(df: pd.DataFrame) -> pd.DataFrame:
         .reset_index(name="frac_below")
     )
     return out.merge(below, on=keys)
+
+
+def dekadal_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per unit x year x dekad, plus national rows, keeping z and native value.
+
+    This is the within-season view: it answers "how is the current season tracking
+    against past years at the same point", which the annual aggregates cannot.
+    """
+    if "z" not in df.columns:
+        df = derive_zscore(df)
+    df = df.dropna(subset=["value"]).copy()
+    df["year"] = df["date"].dt.year
+
+    cols = ["indicator", "asap1_id", "adm1_name", "year", "dekad", "value", "z"]
+    national = (
+        df.groupby(["indicator", "year", "dekad"])[["value", "z"]]
+        .mean()
+        .reset_index()
+        .assign(asap1_id=0, adm1_name=NATIONAL_LABEL)
+    )
+    return pd.concat([df[cols], national[cols]], ignore_index=True).sort_values(
+        ["indicator", "asap1_id", "year", "dekad"]
+    )
+
+
+def dekad_trends(dekadal: pd.DataFrame, start_year: int) -> pd.DataFrame:
+    """Trend in z across years, computed separately for each dekad of the season.
+
+    Lets the site show a fitted line in single-dekad mode, and shows whether the drift
+    is concentrated in part of the season rather than spread across it.
+    """
+    subset = dekadal[dekadal["year"] >= start_year]
+    rows = []
+    for (indicator, asap1_id, dekad), group in subset.groupby(
+        ["indicator", "asap1_id", "dekad"]
+    ):
+        years = group["year"].to_numpy(dtype=float)
+        values = group["z"].to_numpy(dtype=float)
+        rows.append(
+            {
+                "indicator": indicator,
+                "asap1_id": int(asap1_id),
+                "dekad": int(dekad),
+                **_trend_one(years, values),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _trend_one(years: np.ndarray, values: np.ndarray) -> dict:
