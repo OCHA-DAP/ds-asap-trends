@@ -1,0 +1,51 @@
+name: Update ASAP trends and deploy site
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # ASAP publishes a new dekad 3x/month; monthly is plenty for a trend analysis.
+    - cron: "0 6 4 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Download ASAP indicator statistics
+        run: uv run python scripts/download.py --country SSD
+
+      - name: Compute trends and build site data
+        run: uv run python scripts/analyze.py --country SSD
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

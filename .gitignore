@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.ruff_cache/
+.marimo.toml
+
+# Raw ASAP exports are re-downloadable from the source endpoint and bulky;
+# data/processed/ (small, derived) is committed so the site builds without a fetch.
+data/raw/
