@@ -37,6 +37,14 @@ severity. Frame results that way; the slope is a means, not the finding.
   indicator's full record (better percentiles); the trend figures use `COMMON_START_YEAR`
   (cross-indicator comparability). So the season card can say "of 38 years" while the trend
   chart shows 26 points. The UI explains it — keep that explanation if you touch the copy.
+- **`National (mean of units)` is an UNWEIGHTED mean — known limitation, see issue #1.**
+  Defensible for the breach-rate framing (ASAP warns per unit, so "the average unit" is the
+  right frame) but wrong for the current-season "how are national conditions" view. The
+  headline trend is robust to it (all 10 units +0.23 to +0.65 z/decade, 10/10 significant);
+  the current-season national values are not (WSI cropland spans −2.79 to +0.64 across
+  units). If you fix it, weight by **cropland/rangeland area**, never admin polygon area,
+  and note that no ASAP tabular product carries per-unit area — it needs zonal stats over
+  the mask rasters, cached once. Full analysis and the download gotchas are in issue #1.
 
 ## Conventions
 
